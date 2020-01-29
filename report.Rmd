@@ -1,0 +1,537 @@
+---
+title: "(Not So) Practical SQL"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+```{r,echo=FALSE}
+library(tidyverse)
+library(sqldf)
+library(DT)
+```
+
+# Executive Summary
+[DataRockie](https://datarockie.com/kasidis-satangmongkol/) recently released a new book called [Practical SQL](https://www.facebook.com/datarockie/photos/a.995943647085879/3151519084861647/?type=3&theater) with a thumbnail containing a query, noting "buy this if you want to be able to write queries like this". We discuss in this article that the thumbnail query contains many flaws that even SQL beginners will notice such as hard-coded values and ambiguous aliases and will have trouble if deployed in practice. We address these flaws and suggest an optimized query that is more readable, more flexible and less likely to break in production. 
+
+Considering this query is shown as **the** query they wanted to highlight for their book, would like buyers and readers of the book and overall [DataRockie](https://datarockie.com/kasidis-satangmongkol/) content to consider the quality of their content.
+
+# Preparation
+We prepare a set of sythetic dataframes that resemble the tables being queried by the original "practical" query. We made a few modifications such as replacing `invoice_data` with `invoiceyear` because date conversion is irrelevant to our purpose and we also needed to guess which table `invoiceyear` and `total` are a part of since despite using aliases [DataRockie](https://datarockie.com/kasidis-satangmongkol/) did not add the aliases to these columns.
+
+For SQL tools, we are using [sqldf](https://cran.r-project.org/web/packages/sqldf/sqldf.pdf) library based on `sqlite` since [DataRockie](https://datarockie.com/kasidis-satangmongkol/) claimed that he was not able to pivot properly "because he was using sqlite". We will show with our example that it is possible to create a readable, flexible and resilient query with `sqlite`.
+
+```{r}
+set.seed(1412)
+keywords = c('SCAN TABLE','SCAN SUBQUERY','SEARCH TABLE')
+nb_invoice = 10000
+customerid_all = sapply(1:100, FUN=function(x) paste0('customer',x))
+employeesid_all = sapply(1:100, FUN=function(x) paste0('employee',x))
+customerid_sampled = sample(customerid_all,nb_invoice,replace=TRUE)
+employeedid_sampled = sample(employeesid_all,nb_invoice,replace=TRUE)
+invoicesid_all = sapply(1:nb_invoice, FUN=function(x) paste0('invoice',x))
+total_all = abs(rnorm(nb_invoice,mean=1000,sd=500))
+invoiceyear_all = 2009:2013
+invoiceyear_sampled = sample(invoiceyear_all,nb_invoice,replace=TRUE)
+firstname_all = sapply(1:100, FUN=function(x) paste0('firstname',x))
+lastname_all = sapply(1:100, FUN=function(x) paste0('lastname',x))
+trackid_all = sapply(1:nb_invoice, FUN=function(x) paste0('track',x))
+genreid_all = sapply(1:2, FUN=function(x) paste0('genre',x))
+genrename = c('Jazz','Blues')
+genreid_sampled = sample(genreid_all,nb_invoice,replace=TRUE)
+
+#invoice
+invoices = data.frame(customerid = customerid_sampled,
+                        invoicesid = invoicesid_all,
+                        total=total_all,
+                        invoiceyear=invoiceyear_sampled)
+
+#invoice name; simply to connect trackid
+invoice_name = data.frame(invoicesid = invoicesid_all, 
+                            trackid = trackid_all)
+
+#tracks; simply to connect genre
+tracks = data.frame(trackid = trackid_all, 
+                      genreid = genreid_sampled)
+
+#customers; to connect with employees
+customers = data.frame(customerid = customerid_all, supportrepid = employeesid_all)
+
+#employees
+#case where there are 3 employees
+employees = data.frame(employeesid = c('employee1','employee2','employee3'), 
+                         supportrepid = c('employee1','employee2','employee3'), 
+                         firstname=c('Jane','Margaret','Steve'), 
+                         lastname=c('Peacock','Park','Johnson'))
+#case where there are 100 employees
+employees2 = data.frame(employeesid = employeesid_all, 
+                         supportrepid = employeesid_all, 
+                         firstname=firstname_all, 
+                         lastname=lastname_all)
+
+#genre
+genres = data.frame(name = genrename, genreid=genreid_all)
+```
+
+# Issues as Analytic Query
+
+The original query has the following issues as an analytic query, that to be fair you do not have to be a data professional to detect since computer science/engineering undergrads most likely learn this in class.
+
+First, let us look at the query within the with-clause, `tmp`. Immediately, if you have ever worked in a production environment or even adhoc analysis where you are not the only one writing and reading the queries, you will see that:
+
+1. **Table aliasing as unidentifiable names**: when people look at your queries they are not going to understand what A, B, C, ... means. This might work for a query that no one never, ever changes but even then A to F will give yourself and your coworkers (data scientists, data engineers, and Will from Marketing who can do query) a headache when they need to read it.
+
+2. **Inconsitency in aliasing for column names**: you can see in the select that column names sometimes have an alias (`E.firstname`, `E.lastname`) and sometimes do not (`total`, `invoiceyear`). This is understandable if you know by heart which tables have which columns (in a large enough system, no one does), but it is very dangeous since you risk pulling some columns from the tables you do not mean to pull from. In fact, most SQL will not allow you to do this if there are duplicate column names in multiple tables.
+
+```
+	select
+		E.firstname || ' ' || E.lastname fullname,
+		invoiceyear year,
+		SUM(total) jazz_revenue --where does total come from?
+	
+	--what is a, b, c, d, ...
+	from invoices A join invoice_name B ON A.invoicesid = B.invoicesid
+	JOIN tracks C ON B.trackid = C.trackid
+	JOIN customers D ON A.customerid = D.customerid
+	JOIN employees E ON E.employeesid = D.supportrepid
+	JOIN genres F ON C.genreid = F.genreid
+		AND F.name = 'Jazz'
+		
+	--every time i will need to look up and see what is 1 and 2
+	GROUP BY 1, 2
+```
+
+Readibility is important but it is not a fatal flaw. When you look at the main query itself, you find one that might be:
+
+3. **Hard-coding the names for each manager** is at best time-consuming, and at worst simply wasteful. As one commenter pointed out, what if you have 100 managers? Even a marketing guy doing adhoc query does not want to copy and paste then replace the names of 100 people. Moreover, the query excessively scans the table with each where-clause only to union the data later.
+
+```
+SELECT 
+	'Jane Peacock' manager_name,
+	(SELECT jazz_revenue FROM tmp WHERE fullname = 'Jane Peacock' AND year = '2009') Y2009,
+	(SELECT jazz_revenue FROM tmp WHERE fullname = 'Jane Peacock' AND year = '2010') Y2010,
+	(SELECT jazz_revenue FROM tmp WHERE fullname = 'Jane Peacock' AND year = '2011') Y2011,
+	(SELECT jazz_revenue FROM tmp WHERE fullname = 'Jane Peacock' AND year = '2012') Y2012,
+	(SELECT jazz_revenue FROM tmp WHERE fullname = 'Jane Peacock' AND year = '2013') Y2013,
+	(SELECT SUM(jazz_revenue) FROM tmp WHERE fullname = 'Jane Peacock') total_jazz_sales
+UNION
+SELECT 
+	'Margaret Park' manager_name,
+	(SELECT jazz_revenue FROM tmp WHERE fullname = 'Margaret Park' AND year = '2009') Y2009,
+	(SELECT jazz_revenue FROM tmp WHERE fullname = 'Margaret Park' AND year = '2010') Y2010,
+	(SELECT jazz_revenue FROM tmp WHERE fullname = 'Margaret Park' AND year = '2011') Y2011,
+	(SELECT jazz_revenue FROM tmp WHERE fullname = 'Margaret Park' AND year = '2012') Y2012,
+	(SELECT jazz_revenue FROM tmp WHERE fullname = 'Margaret Park' AND year = '2013') Y2013,
+	(SELECT SUM(jazz_revenue) FROM tmp WHERE fullname = 'Margaret Park') total_jazz_sales
+UNION
+SELECT 
+	'Steve Johnson' manager_name,
+	(SELECT jazz_revenue FROM tmp WHERE fullname = 'Steve Johnson' AND year = '2009') Y2009,
+	(SELECT jazz_revenue FROM tmp WHERE fullname = 'Steve Johnson' AND year = '2010') Y2010,
+	(SELECT jazz_revenue FROM tmp WHERE fullname = 'Steve Johnson' AND year = '2011') Y2011,
+	(SELECT jazz_revenue FROM tmp WHERE fullname = 'Steve Johnson' AND year = '2012') Y2012,
+	(SELECT jazz_revenue FROM tmp WHERE fullname = 'Steve Johnson' AND year = '2013') Y2013,
+	(SELECT SUM(jazz_revenue) FROM tmp WHERE fullname = 'Steve Johnson') total_jazz_sales
+) ORDER BY total_jazz_sales DESC;
+```
+
+The result of the original "practical" query is as follows:
+
+```{r,echo=FALSE}
+q = "
+with tmp as (
+	select
+		E.firstname || ' ' || E.lastname fullname,
+		invoiceyear year,
+		SUM(total) jazz_revenue
+	from invoices A join invoice_name B ON A.invoicesid = B.invoicesid
+	JOIN tracks C ON B.trackid = C.trackid
+	JOIN customers D ON A.customerid = D.customerid
+	JOIN employees E ON E.employeesid = D.supportrepid
+	JOIN genres F ON C.genreid = F.genreid
+		AND F.name = 'Jazz'
+	GROUP BY 1, 2)
+	
+SELECT * FROM (
+SELECT 
+	'Jane Peacock' manager_name,
+	(SELECT jazz_revenue FROM tmp WHERE fullname = 'Jane Peacock' AND year = '2009') Y2009,
+	(SELECT jazz_revenue FROM tmp WHERE fullname = 'Jane Peacock' AND year = '2010') Y2010,
+	(SELECT jazz_revenue FROM tmp WHERE fullname = 'Jane Peacock' AND year = '2011') Y2011,
+	(SELECT jazz_revenue FROM tmp WHERE fullname = 'Jane Peacock' AND year = '2012') Y2012,
+	(SELECT jazz_revenue FROM tmp WHERE fullname = 'Jane Peacock' AND year = '2013') Y2013,
+	(SELECT SUM(jazz_revenue) FROM tmp WHERE fullname = 'Jane Peacock') total_jazz_sales
+UNION
+SELECT 
+	'Margaret Park' manager_name,
+	(SELECT jazz_revenue FROM tmp WHERE fullname = 'Margaret Park' AND year = '2009') Y2009,
+	(SELECT jazz_revenue FROM tmp WHERE fullname = 'Margaret Park' AND year = '2010') Y2010,
+	(SELECT jazz_revenue FROM tmp WHERE fullname = 'Margaret Park' AND year = '2011') Y2011,
+	(SELECT jazz_revenue FROM tmp WHERE fullname = 'Margaret Park' AND year = '2012') Y2012,
+	(SELECT jazz_revenue FROM tmp WHERE fullname = 'Margaret Park' AND year = '2013') Y2013,
+	(SELECT SUM(jazz_revenue) FROM tmp WHERE fullname = 'Margaret Park') total_jazz_sales
+UNION
+SELECT 
+	'Steve Johnson' manager_name,
+	(SELECT jazz_revenue FROM tmp WHERE fullname = 'Steve Johnson' AND year = '2009') Y2009,
+	(SELECT jazz_revenue FROM tmp WHERE fullname = 'Steve Johnson' AND year = '2010') Y2010,
+	(SELECT jazz_revenue FROM tmp WHERE fullname = 'Steve Johnson' AND year = '2011') Y2011,
+	(SELECT jazz_revenue FROM tmp WHERE fullname = 'Steve Johnson' AND year = '2012') Y2012,
+	(SELECT jazz_revenue FROM tmp WHERE fullname = 'Steve Johnson' AND year = '2013') Y2013,
+	(SELECT SUM(jazz_revenue) FROM tmp WHERE fullname = 'Steve Johnson') total_jazz_sales
+) ORDER BY total_jazz_sales DESC;"
+
+datatable(sqldf(q)) %>% formatRound(1:7,1)
+```
+
+# Issues with Performance
+
+Performance is one of the most important issues in writing SQL queries even though you are not a data engineer. Analysts at large corporations such as Google and Facebook are tracked by the performance of their queries; that is, if your queries are subpar in terms of performance, your queries will be deprioritized by the system and thus delaying your work (try BigQuery and see how it outputs size of memory scanned and costs). 
+
+You can analyze how many operations were required to execute a query using `explain query plan` in `sqlite`. This is not exactly performance measurement but you can see at least how many steps are to be done. The multiple where-clauses and unions in the original "practical" query tally up to 190 operations.
+
+```{r, echo=FALSE}
+q = "
+explain query plan with tmp as (
+	select
+		E.firstname || ' ' || E.lastname fullname,
+		invoiceyear year,
+		SUM(total) jazz_revenue
+	from invoices A join invoice_name B ON A.invoicesid = B.invoicesid
+	JOIN tracks C ON B.trackid = C.trackid
+	JOIN customers D ON A.customerid = D.customerid
+	JOIN employees E ON E.employeesid = D.supportrepid
+	JOIN genres F ON C.genreid = F.genreid
+		AND F.name = 'Jazz'
+	GROUP BY 1, 2)
+	
+SELECT * FROM (
+SELECT 
+	'Jane Peacock' manager_name,
+	(SELECT jazz_revenue FROM tmp WHERE fullname = 'Jane Peacock' AND year = '2009') Y2009,
+	(SELECT jazz_revenue FROM tmp WHERE fullname = 'Jane Peacock' AND year = '2010') Y2010,
+	(SELECT jazz_revenue FROM tmp WHERE fullname = 'Jane Peacock' AND year = '2011') Y2011,
+	(SELECT jazz_revenue FROM tmp WHERE fullname = 'Jane Peacock' AND year = '2012') Y2012,
+	(SELECT jazz_revenue FROM tmp WHERE fullname = 'Jane Peacock' AND year = '2013') Y2013,
+	(SELECT SUM(jazz_revenue) FROM tmp WHERE fullname = 'Jane Peacock') total_jazz_sales
+UNION
+SELECT 
+	'Margaret Park' manager_name,
+	(SELECT jazz_revenue FROM tmp WHERE fullname = 'Margaret Park' AND year = '2009') Y2009,
+	(SELECT jazz_revenue FROM tmp WHERE fullname = 'Margaret Park' AND year = '2010') Y2010,
+	(SELECT jazz_revenue FROM tmp WHERE fullname = 'Margaret Park' AND year = '2011') Y2011,
+	(SELECT jazz_revenue FROM tmp WHERE fullname = 'Margaret Park' AND year = '2012') Y2012,
+	(SELECT jazz_revenue FROM tmp WHERE fullname = 'Margaret Park' AND year = '2013') Y2013,
+	(SELECT SUM(jazz_revenue) FROM tmp WHERE fullname = 'Margaret Park') total_jazz_sales
+UNION
+SELECT 
+	'Steve Johnson' manager_name,
+	(SELECT jazz_revenue FROM tmp WHERE fullname = 'Steve Johnson' AND year = '2009') Y2009,
+	(SELECT jazz_revenue FROM tmp WHERE fullname = 'Steve Johnson' AND year = '2010') Y2010,
+	(SELECT jazz_revenue FROM tmp WHERE fullname = 'Steve Johnson' AND year = '2011') Y2011,
+	(SELECT jazz_revenue FROM tmp WHERE fullname = 'Steve Johnson' AND year = '2012') Y2012,
+	(SELECT jazz_revenue FROM tmp WHERE fullname = 'Steve Johnson' AND year = '2013') Y2013,
+	(SELECT SUM(jazz_revenue) FROM tmp WHERE fullname = 'Steve Johnson') total_jazz_sales
+) ORDER BY total_jazz_sales DESC;"
+
+df = sqldf(q)
+datatable(df)
+```
+
+```{r,echo=FALSE}
+#aggregate stats for operations
+for (k in keywords){
+  df[k] = grepl(k,df$detail)
+}
+agg1 = data.frame(colSums(df[,5:7]))
+names(agg1) = 'nb_operations'
+agg1$flag = 'practical'
+agg1$operation = rownames(agg1)
+```
+
+When we try running the optimized version of the query, you can see that it only does 13 operations, over 10x reduction in number of operations. Curious readers are encouraged to try running this query in their environment and measure performance in terms of memory scanned or costs.
+
+```{r, echo=FALSE}
+q = "
+explain query plan WITH joined_inv AS (
+	SELECT
+		emp.firstname || ' ' || emp.lastname AS fullname,
+		invoiceyear AS year,
+		total
+	FROM invoices AS inv 
+	JOIN invoice_name AS inv_name 
+		ON inv.invoicesid = inv_name.invoicesid
+	JOIN tracks AS trk 
+		ON inv_name.trackid = trk.trackid
+	JOIN customers AS cust 
+		ON inv.customerid = cust.customerid
+	JOIN employees AS emp 
+		ON emp.employeesid = cust.supportrepid
+	JOIN genres AS ge 
+		ON trk.genreid = ge.genreid
+		AND ge.name = 'Jazz'
+), 
+
+sum_revenue AS (
+	SELECT 
+		fullname, 
+		year, 
+		sum(total) AS jazz_revenue
+	FROM joined_inv
+	GROUP BY fullname, year
+), 
+
+pivot_by_name as (
+	SELECT 
+	 	fullname AS manager_name,
+	 	SUM(CASE WHEN year = '2009' THEN jazz_revenue END) AS Y2009,
+	 	SUM(CASE WHEN year = '2010' THEN jazz_revenue END) AS Y2010,
+	 	SUM(CASE WHEN year = '2011' THEN jazz_revenue END) AS Y2011,
+	 	SUM(CASE WHEN year = '2012' THEN jazz_revenue END) AS Y2012,
+	 	SUM(CASE WHEN year = '2013' THEN jazz_revenue END) AS Y2013,
+	 	SUM(jazz_revenue) AS total_jazz_sales
+	FROM sum_revenue
+	WHERE fullname IN ('Jane Peacock', 'Margaret Park', 'Steve Johnson')
+	GROUP BY fullname)
+
+SELECT 
+	manager_name,
+	Y2009,
+	Y2010,
+	Y2011,
+	Y2012,
+	Y2013,
+	total_jazz_sales
+FROM pivot_by_name
+ORDER BY total_jazz_sales DESC;
+"
+df = sqldf(q)
+datatable(df)
+```
+
+Especially if you look at specific operations `SCAN TABLE` (fine for small tables but for big ones like `invoice` will be disastrous to do multiple times), `SCAN SUBQUERY` and `SEARCH TABLE`, the difference becomes even more clear.
+
+```{r, echo=FALSE}
+#aggregate stats for operations
+for (k in keywords){
+  df[k] = grepl(k,df$detail)
+}
+agg2 = data.frame(colSums(df[,5:7]))
+names(agg2) = 'nb_operations'
+agg2$flag = 'optimized'
+agg2$operation = rownames(agg2)
+agg = rbind(agg1,agg2)
+
+g = ggplot(agg, aes(x=operation,y=nb_operations,fill=flag)) + geom_col(position='dodge') + theme_minimal() +
+  theme(legend.position = 'bottom', legend.title = element_blank()) +
+  geom_text(aes(x=operation,y=nb_operations+3,label=nb_operations),position = position_dodge(width = 1)) +
+  xlab('Operations') + ylab('Number of Operations Done')
+g
+```
+
+# Optimized Query Works for Three Managers, One Hundred Managers and More
+
+We first try to fix the issues with unidentifiable aliases in the `joined_inv` temporary table (previously `tmp`). You can see that `inv`, `inv_name`, `cust`, `trk`, and `ge` are much easier to guess than A, B, C, ...
+
+```
+WITH joined_inv AS (
+	SELECT
+		emp.firstname || ' ' || emp.lastname AS fullname,
+		invoiceyear AS year,
+		total
+	FROM invoices AS inv 
+	JOIN invoice_name AS inv_name 
+		ON inv.invoicesid = inv_name.invoicesid
+	JOIN tracks AS trk 
+		ON inv_name.trackid = trk.trackid
+	JOIN customers AS cust 
+		ON inv.customerid = cust.customerid
+	JOIN employees AS emp 
+		ON emp.employeesid = cust.supportrepid
+	JOIN genres AS ge 
+		ON trk.genreid = ge.genreid
+		AND ge.name = 'Jazz'
+```
+
+Then comes the meat of the optimization: getting rid of the hard-coded where-union-clause-pocalypse. There are many ways to do this including the pivot functions of some SQL but we are doing it the classic way. First, we create another temporary table `sum_revenue` to group by every Jazz revenue for each manager.
+
+```
+sum_revenue AS (
+	SELECT 
+		fullname, 
+		year, 
+		sum(total) AS jazz_revenue
+	FROM joined_inv
+	GROUP BY fullname, year
+), 
+```
+
+Then, we use sum-case-when combination to aggregate the revenues by year. And lastly, we just order by total revenues in descending order.
+
+```
+pivot_by_name as (
+	SELECT 
+	 	fullname AS manager_name,
+	 	SUM(CASE WHEN year = '2009' THEN jazz_revenue END) AS Y2009,
+	 	SUM(CASE WHEN year = '2010' THEN jazz_revenue END) AS Y2010,
+	 	SUM(CASE WHEN year = '2011' THEN jazz_revenue END) AS Y2011,
+	 	SUM(CASE WHEN year = '2012' THEN jazz_revenue END) AS Y2012,
+	 	SUM(CASE WHEN year = '2013' THEN jazz_revenue END) AS Y2013,
+	 	SUM(jazz_revenue) AS total_jazz_sales
+	FROM sum_revenue
+	WHERE fullname IN ('Jane Peacock', 'Margaret Park', 'Steve Johnson')
+	GROUP BY fullname)
+
+SELECT 
+	manager_name,
+	Y2009,
+	Y2010,
+	Y2011,
+	Y2012,
+	Y2013,
+	total_jazz_sales
+FROM pivot_by_name
+ORDER BY total_jazz_sales DESC;
+```
+
+The result of the optimized query is as follows:
+
+```{r, echo=FALSE}
+q = "
+WITH joined_inv AS (
+	SELECT
+		emp.firstname || ' ' || emp.lastname AS fullname,
+		invoiceyear AS year,
+		total
+	FROM invoices AS inv 
+	JOIN invoice_name AS inv_name 
+		ON inv.invoicesid = inv_name.invoicesid
+	JOIN tracks AS trk 
+		ON inv_name.trackid = trk.trackid
+	JOIN customers AS cust 
+		ON inv.customerid = cust.customerid
+	JOIN employees AS emp 
+		ON emp.employeesid = cust.supportrepid
+	JOIN genres AS ge 
+		ON trk.genreid = ge.genreid
+		AND ge.name = 'Jazz'
+), 
+
+sum_revenue AS (
+	SELECT 
+		fullname, 
+		year, 
+		sum(total) AS jazz_revenue
+	FROM joined_inv
+	GROUP BY fullname, year
+), 
+
+pivot_by_name as (
+	SELECT 
+	 	fullname AS manager_name,
+	 	SUM(CASE WHEN year = '2009' THEN jazz_revenue END) AS Y2009,
+	 	SUM(CASE WHEN year = '2010' THEN jazz_revenue END) AS Y2010,
+	 	SUM(CASE WHEN year = '2011' THEN jazz_revenue END) AS Y2011,
+	 	SUM(CASE WHEN year = '2012' THEN jazz_revenue END) AS Y2012,
+	 	SUM(CASE WHEN year = '2013' THEN jazz_revenue END) AS Y2013,
+	 	SUM(jazz_revenue) AS total_jazz_sales
+	FROM sum_revenue
+	WHERE fullname IN ('Jane Peacock', 'Margaret Park', 'Steve Johnson')
+	GROUP BY fullname)
+
+SELECT 
+	manager_name,
+	Y2009,
+	Y2010,
+	Y2011,
+	Y2012,
+	Y2013,
+	total_jazz_sales
+FROM pivot_by_name
+ORDER BY total_jazz_sales DESC;
+"
+
+datatable(sqldf(q))  %>% formatRound(1:7,1)
+```
+
+The most useful part about the optimized query is that it does not limit you to 3 managers but allow you to get results for any number of managers, just by commenting out the where-clause.
+
+```
+pivot_by_name as (
+	SELECT 
+	 	fullname AS manager_name,
+	 	SUM(CASE WHEN year = '2009' THEN jazz_revenue END) AS Y2009,
+	 	SUM(CASE WHEN year = '2010' THEN jazz_revenue END) AS Y2010,
+	 	SUM(CASE WHEN year = '2011' THEN jazz_revenue END) AS Y2011,
+	 	SUM(CASE WHEN year = '2012' THEN jazz_revenue END) AS Y2012,
+	 	SUM(CASE WHEN year = '2013' THEN jazz_revenue END) AS Y2013,
+	 	SUM(jazz_revenue) AS total_jazz_sales
+	FROM sum_revenue
+	--WHERE fullname IN ('Jane Peacock', 'Margaret Park', 'Steve Johnson')
+	GROUP BY fullname)
+```
+
+```{r, echo=FALSE}
+q = "
+WITH joined_inv AS (
+	SELECT
+		emp.firstname || ' ' || emp.lastname AS fullname,
+		invoiceyear AS year,
+		total
+	FROM invoices AS inv 
+	JOIN invoice_name AS inv_name 
+		ON inv.invoicesid = inv_name.invoicesid
+	JOIN tracks AS trk 
+		ON inv_name.trackid = trk.trackid
+	JOIN customers AS cust 
+		ON inv.customerid = cust.customerid
+	JOIN employees2 AS emp 
+		ON emp.employeesid = cust.supportrepid
+	JOIN genres AS ge 
+		ON trk.genreid = ge.genreid
+		AND ge.name = 'Jazz'
+), 
+
+sum_revenue AS (
+	SELECT 
+		fullname, 
+		year, 
+		sum(total) AS jazz_revenue
+	FROM joined_inv
+	GROUP BY fullname, year
+), 
+
+pivot_by_name as (
+	SELECT 
+	 	fullname AS manager_name,
+	 	SUM(CASE WHEN year = '2009' THEN jazz_revenue END) AS Y2009,
+	 	SUM(CASE WHEN year = '2010' THEN jazz_revenue END) AS Y2010,
+	 	SUM(CASE WHEN year = '2011' THEN jazz_revenue END) AS Y2011,
+	 	SUM(CASE WHEN year = '2012' THEN jazz_revenue END) AS Y2012,
+	 	SUM(CASE WHEN year = '2013' THEN jazz_revenue END) AS Y2013,
+	 	SUM(jazz_revenue) AS total_jazz_sales
+	FROM sum_revenue
+	GROUP BY fullname)
+
+SELECT 
+	manager_name,
+	Y2009,
+	Y2010,
+	Y2011,
+	Y2012,
+	Y2013,
+	total_jazz_sales
+FROM pivot_by_name
+ORDER BY total_jazz_sales DESC;
+"
+
+datatable(sqldf(q))  %>% formatRound(1:7,1)
+```
+
+# Recap
+
+Writing good SQL queries matter regardless of your job positions. Data engineers make their living writing performance-optimized queries. Data scientists and data analysts write readable and flexible queries to work together (also get deprioritized for bad queries). Any backend developer also needs to write good queries so their systems do not slow down. It is no excuse.
+
+We hope that through this article, readers learn how to do proper aliasing, pivoting with sum-case-when and be cautious about where they spend their money or attention. We hope you spend your resources wisely to get better at writing SQL queries.
