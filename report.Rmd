@@ -188,7 +188,7 @@ datatable(sqldf(q)) %>% formatRound(1:7,1)
 
 # Issues with Performance
 
-Performance is one of the most important issues in writing SQL queries even though you are not a data engineer. Analysts at large corporations such as Google and Facebook are tracked by the performance of their queries; that is, if your queries are subpar in terms of performance, your queries will be deprioritized by the system and thus delaying your work (try BigQuery and see how it outputs size of memory scanned and costs). 
+Performance is one of the most important issues in writing SQL queries even though you are not a data engineer. Analysts at large corporations are tracked by the performance of their queries; that is, if your queries are subpar in terms of performance, your queries will be deprioritized by the system and thus delaying your work (try BigQuery and see how it outputs size of memory scanned and costs). 
 
 You can analyze how many operations were required to execute a query using `explain query plan` in `sqlite`. This is not exactly performance measurement but you can see at least how many steps are to be done. The multiple where-clauses and unions in the original "practical" query tally up to 190 operations.
 
@@ -258,8 +258,8 @@ q = "
 explain query plan WITH joined_inv AS (
 	SELECT
 		emp.firstname || ' ' || emp.lastname AS fullname,
-		invoiceyear AS year,
-		total
+		inv.invoiceyear AS year,
+		inv.total
 	FROM invoices AS inv 
 	JOIN invoice_name AS inv_name 
 		ON inv.invoicesid = inv_name.invoicesid
